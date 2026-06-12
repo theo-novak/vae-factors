@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAE Factor Model — Interactive Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.73.0/build/stlite.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+stlite.mount(
+  {
+    requirements: ["plotly", "scipy"],
+    entrypoint: "app.py",
+    files: {
+      "app.py": `
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.set_page_config(layout="wide")
+st.title("Variational Autoencoder Factor Model")
+st.caption("Browser demo — synthetic panel, all maths in pure NumPy (Pyodide). Training a "
+           "nonlinear VAE needs PyTorch, so this demo uses the VAE's linear-Gaussian limit — "
+           "probabilistic PCA, whose exact solution is the top-k principal components. It "
+           "shows the same ideas (data-driven latent factors, reconstruction, covariance value, "
+           "anomaly detection, sector embedding); the full project trains the nonlinear "
+           "torch VAE and conditional VAE.")
+
+PALETTE = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"]
+
+with st.sidebar:
+    st.header("Universe")
+    n_assets = st.slider("Assets", 30, 100, 60, 10)
+    n_days = st.slider("Days", 400, 1200, 800, 100)
+    n_sectors = st.slider("Sectors", 3, 6, 5, 1)
+    k = st.slider("Latent dimension k", 1, 8, 4, 1)
+    seed = st.slider("Seed", 0, 50, 42, 1)
+
+# == Synthetic factor panel (matches the package DGP) =========================
+def generate(n_assets, n_days, n_sectors, seed):
+    rng = np.random.default_rng(seed)
+    k_true = 4
+    market = np.zeros(n_days); vol = np.full(n_days, 0.01)
+    for t in range(1, n_days):
+        vol[t] = 0.9 * vol[t - 1] + 0.1 * abs(rng.normal(0, 0.012))
+        market[t] = rng.normal(0.0003, vol[t])
+    factors = np.zeros((n_days, k_true)); factors[:, 0] = market
+    for j in range(1, k_true):
+        factors[:, j] = rng.normal(0, 0.008, n_days)
+    slope = np.zeros(n_days)
+    for t in range(1, n_days):
+        slope[t] = 0.98 * slope[t - 1] + rng.normal(0, 0.05)
+    factors[:, 1] += 0.004 * np.sign(np.diff(np.concatenate([[0], slope])))
+    sectors = rng.integers(0, n_sectors, n_assets)
+    loadings = np.zeros((n_assets, k_true)); loadings[:, 0] = rng.uniform(0.7, 1.3, n_assets)
+    for i in range(n_assets):
+        loadings[i, 1 + (sectors[i] % (k_true - 1))] = rng.uniform(0.5, 1.2)
+    idio = rng.uniform(0.004, 0.010, n_assets)
+    anomalous = rng.random(n_assets) < 0.15
+    R = factors @ loadings.T + rng.normal(0, 1, (n_days, n_assets)) * idio
+    for i in np.where(anomalous)[0]:
+        for _ in range(rng.integers(4, 9)):
+            t0 = int(rng.integers(25, n_days - 25))
+            R[t0, i] += rng.normal(-0.06, 0.02); R[t0:t0 + 20, i] += -0.003
+    vol_index = np.sqrt(np.convolve(market ** 2, np.ones(21) / 21, mode="same")) * np.sqrt(252)
+    return R, sectors, market, vol_index, slope, anomalous
+
+R, sectors, market, vol_index, slope, anomalous = generate(n_assets, n_days, n_sectors, seed)
+split = int(n_days * 0.7)
+Rtr, Rte = R[:split], R[split:]
+
+# == Probabilistic-PCA encoder/decoder (linear-Gaussian VAE limit) ============
+mean = Rtr.mean(0)
+Xc = Rtr - mean
+U, Svals, Vt = np.linalg.svd(Xc, full_matrices=False)
+W = Vt[:k].T                                   # decoder loadings (N, k)
+latent_all = (R - mean) @ W                    # encoder: latent posterior means (T, k)
+recon_all = latent_all @ W.T + mean            # decoder reconstruction
+cell_err = (R - recon_all) ** 2
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Latent factors", "Reconstruction vs k", "Covariance value", "Anomaly & embedding"])
+
+# == Tab 1 ====================================================================
+with tab1:
+    fig = go.Figure()
+    for j in range(min(k, 4)):
+        fig.add_trace(go.Scatter(y=np.cumsum(latent_all[:, j]), name=f"z{j}",
+                                 line=dict(color=PALETTE[j % len(PALETTE)])))
+    fig.update_layout(template="plotly_dark", height=360,
+        title="Cumulative latent factor trajectories", xaxis_title="Day",
+        yaxis_title="Σ z (factor level)", legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, use_container_width=True)
+
+    def absc(a, b):
+        a = a - a.mean(); b = b - b.mean(); d = a.std() * b.std()
+        return abs(float((a * b).mean() / d)) if d > 1e-12 else 0.0
+    obs = {"market": market, "vol_index": vol_index, "slope": slope}
+    Z = np.array([[absc(latent_all[:, j], v) for v in obs.values()] for j in range(k)])
+    fig1b = go.Figure(go.Heatmap(z=Z, x=list(obs.keys()), y=[f"z{j}" for j in range(k)],
+        colorscale="Viridis", zmin=0, zmax=1, text=np.round(Z, 2), texttemplate="%{text}"))
+    fig1b.update_layout(template="plotly_dark", height=300,
+        title="|correlation| of each latent factor with observable macro variables")
+    st.plotly_chart(fig1b, use_container_width=True)
+    st.markdown(r"""
+The encoder maps each day's cross-section of returns to a point in latent space; the
+sequence of those points is a set of **data-driven daily factors**. Without ever being
+told what the market is, the leading latent dimension lines up almost perfectly with the
+observable market return — the model rediscovers the dominant priced risk. Higher latent
+dimensions pick up sector/style structure that is only weakly tied to the macro series.
+""")
+
+# == Tab 2 ====================================================================
+with tab2:
+    ks = np.arange(1, min(n_assets, 12) + 1)
+    rec_mse, var_expl = [], []
+    total_var = (Xc ** 2).sum()
+    for kk in ks:
+        Wk = Vt[:kk].T
+        rec = (Rte - mean) @ Wk @ Wk.T + mean
+        rec_mse.append(float(((Rte - rec) ** 2).mean()))
+        var_expl.append(float((Svals[:kk] ** 2).sum() / total_var))
+    fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+    fig2.add_trace(go.Scatter(x=ks, y=rec_mse, name="OOS reconstruction MSE",
+        line=dict(color=PALETTE[1], width=3)), secondary_y=False)
+    fig2.add_trace(go.Scatter(x=ks, y=var_expl, name="In-sample variance explained",
+        line=dict(color=PALETTE[2], width=3)), secondary_y=True)
+    fig2.add_vline(x=k, line_dash="dash", line_color="grey", annotation_text="current k")
+    fig2.update_layout(template="plotly_dark", height=400,
+        title="Fidelity vs latent complexity", xaxis_title="Latent dimension k",
+        legend=dict(orientation="h", y=1.12))
+    fig2.update_yaxes(title_text="OOS reconstruction MSE", color=PALETTE[1], secondary_y=False)
+    fig2.update_yaxes(title_text="Variance explained", color=PALETTE[2], secondary_y=True)
+    st.plotly_chart(fig2, use_container_width=True)
+    st.markdown(r"""
+This is the **fidelity–complexity trade-off** (the linear analogue of sweeping the
+β-VAE's KL weight). A few latent factors already explain most of the cross-sectional
+variance; adding more keeps fitting in-sample variance but the out-of-sample
+reconstruction error flattens and eventually rises as later dimensions start to encode
+noise. The β term in the full VAE plays the same regularising role — it caps how much
+the latent code is allowed to encode, pushing unused dimensions toward the N(0, I) prior.
+""")
+
+# == Tab 3 ====================================================================
+with tab3:
+    def sample_cov(X):
+        x = X - X.mean(0); return (x.T @ x) / len(X)
+    def lw_cov(X):
+        S = sample_cov(X); D = np.diag(np.diag(S))
+        x = X - X.mean(0); T = len(X)
+        d2 = ((S - D) ** 2).sum()
+        b2 = sum(((np.outer(x[t], x[t]) - S) ** 2).sum() for t in range(T)) / T ** 2
+        a = min(b2, d2) / d2 if d2 > 0 else 0.0
+        return a * D + (1 - a) * S
+    def factor_cov(X, kk):
+        S = sample_cov(X); w_, V_ = np.linalg.eigh(S); idx = np.argsort(w_)[::-1]
+        Vk = V_[:, idx][:, :kk]; wk = np.clip(w_[idx][:kk], 0, None)
+        low = Vk @ np.diag(wk) @ Vk.T
+        return low + np.diag(np.clip(np.diag(S) - np.diag(low), 1e-8, None))
+    def minvar(S):
+        inv = np.linalg.inv(S + 1e-8 * np.eye(S.shape[0])); o = np.ones(S.shape[0])
+        w = inv @ o; return w / (o @ w)
+    ests = {"Sample": sample_cov(Rtr), "Ledoit-Wolf": lw_cov(Rtr),
+            f"Factor model (k={k})": factor_cov(Rtr, k)}
+    vols = []
+    for name, S in ests.items():
+        port = Rte @ minvar(S); vols.append(port.std() * np.sqrt(252))
+    fig3 = go.Figure(go.Bar(x=list(ests.keys()), y=vols, marker_color=PALETTE[:3],
+        text=[f"{v:.1%}" for v in vols], textposition="outside"))
+    fig3.update_layout(template="plotly_dark", height=400,
+        title="Out-of-sample minimum-variance volatility (lower = better)",
+        yaxis_title="Annualised vol", yaxis_tickformat=".0%")
+    st.plotly_chart(fig3, use_container_width=True)
+    st.markdown(r"""
+The economic test: build each covariance estimator on the training window, form the
+global minimum-variance portfolio, and measure realised out-of-sample volatility. The
+low-rank **factor covariance** (the VAE/PCA structure: a handful of factors plus a
+diagonal idiosyncratic term) typically generalises better than the noisy full sample
+covariance, and is competitive with Ledoit-Wolf. On this *linear* data-generating
+process the linear factor model is near-optimal — which is exactly why the nonlinear
+VAE's edge in the full project comes from regime-conditioning and anomaly detection
+rather than from covariance accuracy alone.
+""")
+
+# == Tab 4 ====================================================================
+with tab4:
+    err = cell_err.mean(0)
+    order = np.argsort(-err)
+    colors = ["#EF553B" if anomalous[i] else "#636EFA" for i in order]
+    fig4 = go.Figure(go.Bar(x=[f"S{i}" for i in order], y=err[order], marker_color=colors))
+    fig4.update_layout(template="plotly_dark", height=320,
+        title="Per-stock reconstruction error (red = planted anomaly)",
+        yaxis_title="mean squared recon. error", xaxis_showticklabels=False)
+    st.plotly_chart(fig4, use_container_width=True)
+
+    # Reconstruction-error heatmap: time (binned) x stocks (worst-reconstructed first)
+    nb = min(60, n_days)
+    edges = np.linspace(0, n_days, nb + 1).astype(int)
+    binned = np.array([cell_err[edges[i]:edges[i + 1], order].mean(0) for i in range(nb)])
+    ylab = [("★ S%d" % i) if anomalous[i] else ("S%d" % i) for i in order]
+    fig4h = go.Figure(go.Heatmap(z=binned.T, x=np.linspace(0, n_days, nb), y=ylab,
+        colorscale="Inferno", colorbar=dict(title="MSE")))
+    fig4h.update_layout(template="plotly_dark", height=460,
+        title="Reconstruction-error heatmap (stocks worst→best top-down; ★ = planted anomaly)",
+        xaxis_title="Day", yaxis_title="Stock")
+    st.plotly_chart(fig4h, use_container_width=True)
+
+    betas = np.linalg.lstsq(np.column_stack([np.ones(n_days), latent_all]), R, rcond=None)[0][1:].T
+    bx = (betas - betas.mean(0)) / (betas.std(0) + 1e-8)
+    _, _, Vb = np.linalg.svd(bx - bx.mean(0), full_matrices=False)
+    coords = (bx - bx.mean(0)) @ Vb[:2].T
+    fig4b = go.Figure()
+    for s in np.unique(sectors):
+        m = sectors == s
+        fig4b.add_trace(go.Scatter(x=coords[m, 0], y=coords[m, 1], mode="markers",
+            name=f"Sector {s}", marker=dict(size=9, color=PALETTE[s % len(PALETTE)])))
+    fig4b.update_layout(template="plotly_dark", height=400,
+        title="Stocks embedded in latent loading space (coloured by sector)",
+        xaxis_title="dim 1", yaxis_title="dim 2")
+    st.plotly_chart(fig4b, use_container_width=True)
+    st.markdown(r"""
+Stocks the model cannot reconstruct — high residual error — are the ones carrying
+variation outside the learned factor structure; the planted anomaly names (red) light up
+clearly, and in the full project these high-error names go on to suffer worse
+idiosyncratic drawdowns. Embedding each stock by its latent loadings recovers the sector
+blocks the model was never told about: names that respond alike to the data-driven
+factors cluster together.
+""")
+`
+    }
+  },
+  document.getElementById("root")
+);
+</script>
+</body>
+</html>
